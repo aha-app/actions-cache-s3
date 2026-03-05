@@ -47,6 +47,35 @@ export function newMinio({
   });
 }
 
+export async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxAttempts: number = 5,
+  baseDelay: number = 1000,
+  operationName: string = "operation"
+): Promise<T> {
+  let lastError: Error;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+
+      if (attempt === maxAttempts) {
+        core.warning(`${operationName} failed after ${maxAttempts} attempts: ${lastError.message}`);
+        throw lastError;
+      }
+
+      const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
+      core.info(`${operationName} failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(delay)}ms: ${lastError.message}`);
+
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastError!;
+}
+
 export function getInputAsBoolean(
   name: string,
   options?: core.InputOptions
@@ -229,7 +258,12 @@ export async function saveCache(standalone: boolean) {
       const object = path.join(key, cacheFileName);
 
       core.info(`Uploading tar to s3. Bucket: ${bucket}, Object: ${object}`);
-      await mc.fPutObject(bucket, object, archivePath, {});
+      await retryWithBackoff(
+        () => mc.fPutObject(bucket, object, archivePath, {}),
+        5,
+        1000,
+        "S3 cache upload"
+      );
       core.info("Cache saved to s3 successfully");
     } catch (e) {
       if (useFallback) {

@@ -15,6 +15,7 @@ import {
   setCacheSizeOutput,
   saveMatchedKey,
   getInput,
+  retryWithBackoff,
 } from "./utils";
 
 process.on("uncaughtException", (e) => core.info("warning: " + e.message));
@@ -27,6 +28,7 @@ async function restoreCache() {
     const paths = getInputAsArray("path");
     const restoreKeys = getInputAsArray("restore-keys");
     const lookupOnly = getInputAsBoolean("lookup-only");
+    const failOnCacheMiss = getInputAsBoolean("fail-on-cache-miss");
 
     try {
       // Inputs are re-evaluted before the post action, so we want to store the original values
@@ -80,7 +82,12 @@ async function restoreCache() {
         core.info(
           `Downloading cache from s3 to ${archivePath}. bucket: ${bucket}, object: ${obj.name}`,
         );
-        await mc.fGetObject(bucket, obj.name, archivePath);
+        await retryWithBackoff(
+          () => mc.fGetObject(bucket, obj.name, archivePath),
+          5,
+          1000,
+          "S3 cache download"
+        );
 
         if (core.isDebug()) {
           await listTar(archivePath, compressionMethod);
@@ -109,8 +116,13 @@ async function restoreCache() {
             core.info("Fallback cache restored successfully");
           } else {
             core.info("Fallback cache restore failed");
+            if (failOnCacheMiss) {
+              throw new Error("Cache not found and fail-on-cache-miss is enabled");
+            }
           }
         }
+      } else if (failOnCacheMiss) {
+        throw new Error("Cache not found and fail-on-cache-miss is enabled");
       }
     }
   } catch (e) {
