@@ -12,10 +12,11 @@ import {
   isGhes,
   newMinio,
   setCacheHitOutput,
+  setCacheMatchedKeyOutput,
   setCacheSizeOutput,
   saveMatchedKey,
   getInput,
-  retryWithBackoff,
+  withRetry,
 } from "./utils";
 
 process.on("uncaughtException", (e) => core.info("warning: " + e.message));
@@ -28,7 +29,6 @@ async function restoreCache() {
     const paths = getInputAsArray("path");
     const restoreKeys = getInputAsArray("restore-keys");
     const lookupOnly = getInputAsBoolean("lookup-only");
-    const failOnCacheMiss = getInputAsBoolean("fail-on-cache-miss");
 
     try {
       // Inputs are re-evaluted before the post action, so we want to store the original values
@@ -68,6 +68,7 @@ async function restoreCache() {
       const cacheHit = matchingKey === key;
       setCacheHitOutput(cacheHit);
       setCacheSizeOutput(obj.size);
+      setCacheMatchedKeyOutput(matchingKey);
       if (lookupOnly) {
         if (cacheHit && obj.size > 0) {
           core.info(
@@ -82,12 +83,7 @@ async function restoreCache() {
         core.info(
           `Downloading cache from s3 to ${archivePath}. bucket: ${bucket}, object: ${obj.name}`,
         );
-        await retryWithBackoff(
-          () => mc.fGetObject(bucket, obj.name, archivePath),
-          5,
-          1000,
-          "S3 cache download"
-        );
+        await withRetry("fGetObject", () => mc.fGetObject(bucket, obj.name!, archivePath));
 
         if (core.isDebug()) {
           await listTar(archivePath, compressionMethod);
@@ -101,6 +97,7 @@ async function restoreCache() {
     } catch (e) {
       core.info("Restore s3 cache failed: " + e.message);
       setCacheHitOutput(false);
+      setCacheMatchedKeyOutput("");
       if (useFallback) {
         if (isGhes()) {
           core.warning("Cache fallback is not supported on Github Enterpise.");
@@ -113,16 +110,12 @@ async function restoreCache() {
           );
           if (fallbackMatchingKey) {
             setCacheHitOutput(fallbackMatchingKey === key);
+            setCacheMatchedKeyOutput(fallbackMatchingKey);
             core.info("Fallback cache restored successfully");
           } else {
             core.info("Fallback cache restore failed");
-            if (failOnCacheMiss) {
-              throw new Error("Cache not found and fail-on-cache-miss is enabled");
-            }
           }
         }
-      } else if (failOnCacheMiss) {
-        throw new Error("Cache not found and fail-on-cache-miss is enabled");
       }
     }
   } catch (e) {

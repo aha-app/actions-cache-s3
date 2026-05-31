@@ -6,6 +6,7 @@ import { State } from "./state";
 import path from "path";
 import {createTar, listTar} from "@actions/cache/lib/internal/tar";
 import * as cache from "@actions/cache";
+import pRetry from 'p-retry';
 
 export function isGhes(): boolean {
   const ghUrl = new URL(
@@ -47,33 +48,19 @@ export function newMinio({
   });
 }
 
-export async function retryWithBackoff<T>(
-  operation: () => Promise<T>,
-  maxAttempts: number = 5,
-  baseDelay: number = 1000,
-  operationName: string = "operation"
-): Promise<T> {
-  let lastError: Error;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error as Error;
-
-      if (attempt === maxAttempts) {
-        core.warning(`${operationName} failed after ${maxAttempts} attempts: ${lastError.message}`);
-        throw lastError;
-      }
-
-      const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
-      core.info(`${operationName} failed (attempt ${attempt}/${maxAttempts}), retrying in ${Math.round(delay)}ms: ${lastError.message}`);
-
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
+export function withRetry<A>(name: string, fn: () => Promise<A>): Promise<A> {
+  if (getInputAsBoolean("retry")) {
+    return pRetry(fn, {
+      retries: getInputAsInt("retry-count") ?? 3,
+      onFailedAttempt: (error) => {
+        core.info(
+          `Failed to ${name}. Attempt ${error.attemptNumber} failed. ${error.message}`
+        );
+      },
+    });
+  } else {
+    return fn();
   }
-
-  throw lastError!;
 }
 
 export function getInputAsBoolean(
@@ -126,6 +113,10 @@ export function setCacheSizeOutput(cacheSize: number): void {
   core.setOutput("cache-size", cacheSize.toString())
 }
 
+export function setCacheMatchedKeyOutput(cacheMatchedKey: string): void {
+  core.setOutput("cache-matched-key", cacheMatchedKey)
+}
+
 type FindObjectResult = {
   item: minio.BucketItem;
   matchingKey: string;
@@ -141,26 +132,30 @@ export async function findObject(
   core.debug("Key: " + JSON.stringify(key));
   core.debug("Restore keys: " + JSON.stringify(restoreKeys));
 
-  core.debug(`Finding exact macth for: ${key}`);
-  const exactMatch = await listObjects(mc, bucket, key);
-  core.debug(`Found ${JSON.stringify(exactMatch, null, 2)}`);
-  if (exactMatch.length) {
-    const result = { item: exactMatch[0], matchingKey: key };
-    core.debug(`Using ${JSON.stringify(result)}`);
-    return result;
+  core.debug(`Finding exact match for: ${key}`);
+  const keyMatches = await listObjects(mc, bucket, key);
+  core.debug(`Found ${JSON.stringify(keyMatches, null, 2)}`);
+  if (keyMatches.length > 0) {
+    const exactMatch = keyMatches.find((obj) => obj.name?.startsWith(key + path.sep));
+    if (exactMatch) {
+      const result = { item: exactMatch, matchingKey: key };
+      core.debug(`Found an exact match; using ${JSON.stringify(result)}`);
+      return result;
+    }
   }
+  core.debug(`Didn't find an exact match`);
 
   for (const restoreKey of restoreKeys) {
     const fn = utils.getCacheFileName(compressionMethod);
     core.debug(`Finding object with prefix: ${restoreKey}`);
     let objects = await listObjects(mc, bucket, restoreKey);
-    objects = objects.filter((o) => o.name.includes(fn));
+    objects = objects.filter((o) => o.name?.includes(fn));
     core.debug(`Found ${JSON.stringify(objects, null, 2)}`);
     if (objects.length < 1) {
       continue;
     }
     const sorted = objects.sort(
-      (a, b) => b.lastModified.getTime() - a.lastModified.getTime()
+      (a, b) => (b.lastModified?.getTime() ?? 0) - (a.lastModified?.getTime() ?? 0)
     );
     const result = { item: sorted[0], matchingKey: restoreKey };
     core.debug(`Using latest ${JSON.stringify(result)}`);
@@ -258,12 +253,7 @@ export async function saveCache(standalone: boolean) {
       const object = path.join(key, cacheFileName);
 
       core.info(`Uploading tar to s3. Bucket: ${bucket}, Object: ${object}`);
-      await retryWithBackoff(
-        () => mc.fPutObject(bucket, object, archivePath, {}),
-        5,
-        1000,
-        "S3 cache upload"
-      );
+      await withRetry("fPutObject", () => mc.fPutObject(bucket, object, archivePath, {}));
       core.info("Cache saved to s3 successfully");
     } catch (e) {
       if (useFallback) {
